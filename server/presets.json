@@ -97,6 +97,28 @@
       "params": [
         {"key": "DB_PATH", "label": "数据库文件路径", "placeholder": "/home/user/data.db", "required": true}
       ]
+    },
+    {
+      "id": "baizhi",
+      "name": "百智工具包（Baizhi MCP）",
+      "description": "百智托管 MCP 工具包，需自有账号 Key；账户和费用独立。安装即连接，Header 写入本地 JSON。",
+      "category": "网络",
+      "config": {
+        "type": "http",
+        "url": "https://agent-toolkit.app.baizhi.cloud/mcp",
+        "headers": {
+          "Authorization": "Bearer {{BAIZHI_API_KEY}}"
+        }
+      },
+      "params": [
+        {
+          "key": "BAIZHI_API_KEY",
+          "label": "百智 API Key（仅填写 Key 本身）",
+          "placeholder": "你的百智工具包 API Key",
+          "required": true,
+          "secret": true
+        }
+      ]
     }
   ]
 }

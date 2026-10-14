@@ -1,6 +1,7 @@
 """Tests for preset marketplace API."""
 
 import pytest
+from fastapi.testclient import TestClient
 import sys
 from pathlib import Path
 
@@ -35,6 +36,40 @@ class TestPresetAPI:
         response = client.post("/api/presets/filesystem/install", json={})
         assert response.status_code == 400
         assert "缺少必填参数" in response.json()["error"]
+
+
+    @pytest.mark.parametrize("params", [{}, {"BAIZHI_API_KEY": ""}])
+    def test_baizhi_missing_key_does_not_start_server(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, params: dict[str, str],
+    ) -> None:
+        from unittest.mock import AsyncMock
+        from server import external_proxy
+
+        start = AsyncMock()
+        monkeypatch.setattr(external_proxy, "add_server", start)
+        response = client.post("/api/presets/baizhi/install", json={"params": params})
+        assert response.status_code == 400
+        start.assert_not_awaited()
+
+    def test_baizhi_key_is_bound_only_to_authorization_header(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from unittest.mock import AsyncMock
+        from server import external_proxy
+
+        key = 'fixture-key"with\\slash'
+        start = AsyncMock(return_value={"ok": True, "tools": []})
+        monkeypatch.setattr(external_proxy, "add_server", start)
+        response = client.post("/api/presets/baizhi/install", json={
+            "params": {"BAIZHI_API_KEY": key},
+        })
+        assert response.status_code == 200
+        name, config = start.await_args.args
+        assert name == "baizhi"
+        assert config["url"] == "https://agent-toolkit.app.baizhi.cloud/mcp"
+        assert key not in config["url"]
+        assert config["headers"] == {"Authorization": "Bearer " + key}
+        assert "env" not in config
 
 
 class TestDangerousPatterns:
