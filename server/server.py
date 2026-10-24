@@ -98,6 +98,26 @@ for name, handler in SEARCH_HANDLERS.items():
 for tool_def in TTS_TOOLS:
     ALL_TOOLS[tool_def["name"]] = tool_def
 
+# TTS 工具实际处理器（原实现只注册了定义、没有 handler，
+# 导致 tools/list 能看到 tts_synthesize 但调用必报“没有对应的处理器”）
+_TTS_OUTPUT_DIR = Path(__file__).parent / "tts_output"
+
+
+async def _handle_tts_synthesize(
+    text: str,
+    voice: str = "zh-CN-XiaoxiaoNeural",
+    provider: str = "edge",
+) -> str:
+    tts_cfg = config.get("services", {}).get("tts", {}).get("config", {}) or {}
+    audio = await tts_synthesize(text=text, voice=voice, provider=provider, config=tts_cfg)
+    _TTS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = _TTS_OUTPUT_DIR / f"tts_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}.mp3"
+    out_path.write_bytes(audio)
+    return f"语音合成完成：{len(audio):,} 字节 MP3 已保存到 {out_path}"
+
+
+ASYNC_HANDLERS_MAP["tts_synthesize"] = _handle_tts_synthesize
+
 # Filter tools based on config
 enabled_tools = set()
 for svc in config.get("services", {}).values():
@@ -136,25 +156,78 @@ def cleanup_expired_sessions() -> None:
             logger.info(f"Session evicted (max count): {sid}")
 
 # ─── Argument Sanitizing (fix for {"input": "<json>"} wrapper) ─
-def _unwrap_arguments(arguments: Any) -> dict[str, Any]:
-    """把 {"input": "<json字符串>"} 这类错误包装逐层解开，返回干净的 dict。
+_WRAPPER_KEYS = ("input", "arguments", "args", "params")
 
-    调用端（userscript / bridge）有时会把整个参数对象 json.dumps 后再塞进
-    一个 {"input": ...} 字典，甚至多层嵌套。这里做兼容，避免 handler 收到
-    非法关键字参数（例如 bing_search(input=...)）。
+_ARG_ALIASES: dict[str, tuple[str, ...]] = {
+    "path": ("file_path", "filepath", "filename", "file", "target_path"),
+    "content": ("contents", "data", "body"),
+    "command": ("cmd", "shell_command"),
+    "url": ("link", "href"),
+    "query": ("q", "keyword", "keywords"),
+}
+
+# 这些参数允许传空字符串（写空文件 / 空文本）
+_ALLOW_EMPTY = {"content", "text"}
+
+
+def _unwrap_arguments(arguments: Any) -> dict[str, Any]:
+    """把各种非标准参数包装逐层解开，返回干净的 dict。
+
+    兼容以下客户端行为：
+      1. arguments 本身是 JSON 字符串: "{\"path\": \"a.txt\"}"
+      2. {"input": "<json字符串>"} 或 {"input": {...}} 包装（可多层嵌套）
+      3. {"arguments": {...}} / {"args": {...}} / {"params": {...}} 包装
+
+    历史 bug：旧实现只处理 dict，遇到字符串参数直接返回 {}，导致
+    write_file 收到空 path，路径被解析成工作区根目录（一个目录），
+    写入时抛 PermissionError [Errno 13]，看起来就像“权限不足并输出工作目录”。
     """
-    for _ in range(4):
-        if isinstance(arguments, dict) and set(arguments.keys()) == {"input"}:
-            inner = arguments["input"]
-            if isinstance(inner, str):
-                try:
-                    inner = json.loads(inner)
-                except json.JSONDecodeError:
-                    break
-            arguments = inner
+    for _ in range(6):
+        if isinstance(arguments, str):
+            text = arguments.strip()
+            if not text:
+                return {}
+            try:
+                arguments = json.loads(text)
+            except json.JSONDecodeError:
+                return {}
             continue
+
+        if isinstance(arguments, dict) and len(arguments) == 1:
+            only_key = next(iter(arguments))
+            if only_key in _WRAPPER_KEYS:
+                inner = arguments[only_key]
+                if isinstance(inner, str) and not inner.strip():
+                    return {}
+                arguments = inner
+                continue
         break
+
     return arguments if isinstance(arguments, dict) else {}
+
+
+def _apply_arg_aliases(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """将常见参数别名映射到工具 schema 里的正式名称。
+
+    只对目标工具 schema 真正声明了的参数生效，不会给 tts 这类
+    同时有 text 参数的工具多塞一个 content（否则会被 _filter_kwargs 判为异常参数）。
+    """
+    props = ((ALL_TOOLS.get(tool_name) or {}).get("inputSchema") or {}).get("properties") or {}
+    if not props or not arguments:
+        return arguments
+
+    fixed = dict(arguments)
+    for canonical, aliases in _ARG_ALIASES.items():
+        if canonical not in props:
+            continue
+        if fixed.get(canonical) not in (None, ""):
+            continue
+        for alias in aliases:
+            if fixed.get(alias) not in (None, ""):
+                fixed[canonical] = fixed.pop(alias)
+                logger.warning(f"参数别名兼容: '{alias}' -> '{canonical}' (工具 {tool_name})")
+                break
+    return fixed
 
 
 def _filter_kwargs(handler: Any, kwargs: dict[str, Any], tool_name: str) -> tuple[dict[str, Any], str | None]:
@@ -191,6 +264,25 @@ def _filter_kwargs(handler: Any, kwargs: dict[str, Any], tool_name: str) -> tupl
         return accepted, f"工具 '{tool_name}' 缺少必填参数: {missing}"
 
     return accepted, None
+
+
+def _validate_required(tool_name: str, arguments: dict[str, Any]) -> str | None:
+    """按工具 schema 的 required 字段校验必填参数，返回错误文本或 None。"""
+    schema = ((ALL_TOOLS.get(tool_name) or {}).get("inputSchema")) or {}
+    props = schema.get("properties") or {}
+    missing = []
+    for key in schema.get("required") or []:
+        value = arguments.get(key)
+        if value is None:
+            missing.append(key)
+        elif key not in _ALLOW_EMPTY and isinstance(value, str) and not value.strip():
+            missing.append(key)
+    if not missing:
+        return None
+    details = "; ".join(
+        f"{m} — {props.get(m, {}).get('description', '无说明')}" for m in missing
+    )
+    return f"工具 '{tool_name}' 缺少必填参数: {missing}。参数说明: {details}"
 
 
 # ─── App ───────────────────────────────────────────────────────
@@ -242,11 +334,13 @@ async def mcp_endpoint(request: Request):
             result = await handle_jsonrpc(msg)
             if result is not None:
                 results.append(result)
-        return JSONResponse(results if results else None, status_code=202)
+        if not results:
+            return Response(status_code=202)
+        return JSONResponse(results)
 
     result = await handle_jsonrpc(body)
     if result is None:
-        return JSONResponse(None, status_code=202)
+        return Response(status_code=202)
     return JSONResponse(result)
 
 
@@ -444,6 +538,10 @@ async def handle_jsonrpc(msg: dict):
             },
         }
 
+    # MCP 规范定义的健康检查方法。旧实现直接落到 "未知方法" 分支。
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
+
     if method == "tools/list":
         tools = [t for name, t in ALL_TOOLS.items() if name in enabled_tools]
         # Add external tools
@@ -456,8 +554,18 @@ async def handle_jsonrpc(msg: dict):
 
     if method == "tools/call":
         tool_name = params.get("name", "") or ""
+        if not tool_name:
+            # 旧实现会继续往下走，最终报出让人摸不着头脑的 "工具 '' 未启用"
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": -32602,
+                    "message": "缺少 'name' 参数：tools/call 必须在 params.name 中指定工具名（可用 tools/list 查询）",
+                },
+            }
         raw_arguments = params.get("arguments", {})
-        arguments = _unwrap_arguments(raw_arguments)
+        arguments = _apply_arg_aliases(tool_name, _unwrap_arguments(raw_arguments))
         if raw_arguments != arguments:
             logger.warning(
                 f"已解包异常参数包装: {json.dumps(raw_arguments, ensure_ascii=False)[:200]} "
@@ -503,6 +611,17 @@ async def handle_jsonrpc(msg: dict):
             }
 
         logger.info(f"工具调用: {tool_name}({json.dumps(arguments, ensure_ascii=False)[:200]})")
+
+        cleanup_expired_sessions()
+
+        required_error = _validate_required(tool_name, arguments)
+        if required_error:
+            logger.error(f"参数校验失败: {required_error}")
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {"content": [{"type": "text", "text": required_error}], "isError": True},
+            }
 
         try:
             if tool_name in ASYNC_HANDLERS_MAP:
@@ -628,11 +747,10 @@ async def api_upload(file: UploadFile = File(...)):
     if not file_bytes:
         return JSONResponse({"error": "上传的文件内容为空"}, status_code=400)
 
-    # Enforce concurrency limit
-    acquired = await asyncio.wait_for(
-        _upload_semaphore.acquire(), timeout=0.1
-    ) if _upload_semaphore._value > 0 else False
-    if not acquired:
+    # Enforce concurrency limit — wait up to 5s for a free slot (旧实现用 _value 探测，有竞态)
+    try:
+        await asyncio.wait_for(_upload_semaphore.acquire(), timeout=5)
+    except asyncio.TimeoutError:
         return JSONResponse(
             {"error": "上传队列已满（最多 3 个并发），请稍后重试", "queue_full": True},
             status_code=429,
@@ -656,7 +774,7 @@ async def api_upload(file: UploadFile = File(...)):
 @app.get("/api/upload/status")
 async def api_upload_status():
     """Return upload queue status."""
-    available = _upload_semaphore._value if hasattr(_upload_semaphore, "_value") else -1
+    available = getattr(_upload_semaphore, "_value", -1)
     return JSONResponse({
         "max_concurrent": 3,
         "available_slots": available,
@@ -678,11 +796,15 @@ if __name__ == "__main__":
     setup_file_logging(args.log_file)
 
     if args.config:
-        config = load_config(Path(args.config))
+        config_path = Path(args.config).resolve()
+        config = load_config(config_path)
         enabled_tools.clear()
         for svc in config.get("services", {}).values():
             if svc.get("type") == "builtin":
                 enabled_tools.update(svc.get("tools", []))
+        # 外部 MCP 服务器的增删也要写回同一个配置文件
+        external_proxy._config_path = config_path
+        logger.info(f"Using config: {config_path}")
 
     logger.info(f"Starting server on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
