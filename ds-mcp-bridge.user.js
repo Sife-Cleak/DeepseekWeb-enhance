@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DS MCP Bridge
 // @namespace    https://github.com/calendar0917/ds-enhance
-// @version      4.2.0
+// @version      4.2.1
 // @description  AI Chat 增强 — MCP 工具调用 + TTS 朗读 + 多站点适配
 // @author       ds-enhance
 // @match        https://chat.deepseek.com/*
@@ -19,7 +19,8 @@
 
   const SCRIPT_PREFIX = '[Bridge]';
   const DEFAULT_MCP_URL = 'http://localhost:8024/mcp';
-  const TOOL_CALL_RE = /```mcp:([\w.-]+)\n([\s\S]*?)```/g;
+  // ── FIX 1: 换行改 \s*，兼容 ```mcp:name{...}``` 无换行写法 ──
+  const TOOL_CALL_RE = /```mcp:([\w.-]+)\s*([\s\S]*?)```/g;
   const SYSTEM_HINT_START = '[系统指令]';
   const SYSTEM_HINT_END = '[系统指令结束]';
   const AUTO_SEND_KEY = 'auto_send';
@@ -193,6 +194,18 @@
     }
   }
 
+  // ── FIX 7: 共享 MCPClient 单例，避免每次工具调用都重新 initialize ──
+  let _sharedClient = null;
+  let _sharedClientUrl = null;
+  function getMCPClient() {
+    const url = GM_getValue('mcp_url', DEFAULT_MCP_URL);
+    if (!_sharedClient || _sharedClientUrl !== url) {
+      _sharedClient = new MCPClient(url);
+      _sharedClientUrl = url;
+    }
+    return _sharedClient;
+  }
+
   // ═══════════════════════════════════════════════════════════════
   //  TTS Client — Text-to-Speech via server API
   // ═══════════════════════════════════════════════════════════════
@@ -334,52 +347,65 @@
   const executedCalls = new Set();
   let _streamDebounce = null;
 
-  function checkForToolCalls(content) {
+  // ── FIX 4: 按 inputSchema 校验参数 ──
+  function validateToolArgs(toolName, args) {
+    const tool = toolRegistry.find(t => t.name === toolName);
+    if (!tool) return { ok: false, reason: `未注册的工具: ${toolName}` };
+    const schema = tool.inputSchema;
+    if (!schema || !schema.properties) return { ok: true };
+    const required = schema.required || [];
+    for (const key of required) {
+      if (!(key in args)) return { ok: false, reason: `缺少必填参数: ${key}` };
+    }
+    const allowed = new Set(Object.keys(schema.properties));
+    for (const key of Object.keys(args)) {
+      if (!allowed.has(key)) return { ok: false, reason: `未知参数: ${key}` };
+    }
+    return { ok: true };
+  }
+
+  // ── FIX 2 & 3: 只保留 ```mcp:name 协议；解析失败不 fallback；支持 final 标记 ──
+  function checkForToolCalls(content, { final = false } = {}) {
     if (!content || !toolRegistry.length) return;
 
-    // Strategy 1: Match ```mcp:tool_name\n{...}\n```
     const re = new RegExp(TOOL_CALL_RE.source, 'g');
     let match;
     while ((match = re.exec(content)) !== null) {
       const toolName = match[1];
       const rawArgs = match[2].trim();
-      let args = {};
-      try { args = JSON.parse(rawArgs); }
-      catch { args = { input: rawArgs }; }
 
-      const key = toolName + ':' + JSON.stringify(args);
+      // 未知工具直接跳过（防止 AI 幻觉/复述导致误调用）
+      if (!toolRegistry.some(t => t.name === toolName)) {
+        console.warn(`${SCRIPT_PREFIX} 忽略未知工具: ${toolName}`);
+        continue;
+      }
+
+      let args;
+      try {
+        args = rawArgs ? JSON.parse(rawArgs) : {};
+      } catch (e) {
+        // 流式未结束 → 参数可能还没写完，等下一轮或 final；不再 fallback 成 {input}
+        if (!final) continue;
+        console.warn(`${SCRIPT_PREFIX} 参数 JSON 解析失败，跳过: ${toolName}`, e.message);
+        toast(`${toolName} 参数解析失败，已跳过`, 'error');
+        continue;
+      }
+
+      const check = validateToolArgs(toolName, args);
+      if (!check.ok) {
+        if (!final) continue;
+        console.warn(`${SCRIPT_PREFIX} 参数校验失败: ${toolName}`, check.reason, args);
+        toast(`${toolName} 参数校验失败: ${check.reason}`, 'error');
+        continue;
+      }
+
+      // 去重：同一完整代码块只执行一次（progress / load / fetch 三处 hook 安全）
+      const key = toolName + '::' + match[0];
       if (executedCalls.has(key)) continue;
       executedCalls.add(key);
 
       console.log(`${SCRIPT_PREFIX} Tool call: ${toolName}`, args);
       executeToolCall(toolName, args);
-    }
-
-    // Strategy 2: Match registered tool names directly
-    // Handles SSE token boundary truncation
-    for (const tool of toolRegistry) {
-      const name = tool.name;
-      const idx = content.indexOf(name);
-      if (idx === -1) continue;
-
-      const afterName = content.substring(idx + name.length);
-      const braceStart = afterName.indexOf('{');
-      if (braceStart === -1) continue;
-
-      const braceEnd = afterName.indexOf('}', braceStart);
-      if (braceEnd === -1) continue;
-
-      const jsonStr = afterName.substring(braceStart, braceEnd + 1);
-      let args = {};
-      try { args = JSON.parse(jsonStr); }
-      catch { args = { input: jsonStr }; }
-
-      const key = name + ':' + JSON.stringify(args);
-      if (executedCalls.has(key)) continue;
-      executedCalls.add(key);
-
-      console.log(`${SCRIPT_PREFIX} Tool call: ${name}`, args);
-      executeToolCall(name, args);
     }
   }
 
@@ -461,11 +487,12 @@
 
           if (_streamDebounce) clearTimeout(_streamDebounce);
           _streamDebounce = setTimeout(() => {
-            if (requestContent) checkForToolCalls(requestContent);
+            if (requestContent) checkForToolCalls(requestContent); // 流式中途：final=false
           }, 1000);
         } catch { /* ignore */ }
       });
 
+      // ── FIX 5: load 时标记 final，允许最后一次解析执行 ──
       this.addEventListener('load', function () {
         try {
           const rt = this.responseText || '';
@@ -476,7 +503,7 @@
           }
         } catch { /* ignore */ }
         if (_streamDebounce) clearTimeout(_streamDebounce);
-        checkForToolCalls(requestContent);
+        checkForToolCalls(requestContent, { final: true });
       });
     }
 
@@ -498,9 +525,10 @@
       const contentType = response.headers?.get('content-type') || '';
 
       const clone = response.clone();
+      // ── FIX 5: fetch 也是完整响应，标记 final ──
       clone.text().then(text => {
         const content = parseSSEChunk(text);
-        if (content) checkForToolCalls(content);
+        if (content) checkForToolCalls(content, { final: true });
       }).catch(() => { });
 
       return response;
@@ -513,8 +541,8 @@
   //  Tool Execution & Result Injection
   // ═══════════════════════════════════════════════════════════════
   async function executeToolCall(toolName, args) {
-    const mcpUrl = GM_getValue('mcp_url', DEFAULT_MCP_URL);
-    const client = new MCPClient(mcpUrl);
+    // ── FIX 7: 复用共享 client ──
+    const client = getMCPClient();
 
     try {
       toast(`调用工具: ${toolName}...`, 'info');
@@ -806,7 +834,7 @@
     panel.id = 'mcp-panel';
     panel.innerHTML = `
       <div class="hd">
-        <h3>DS MCP Bridge <span class="ver">v4.2.0</span></h3>
+        <h3>DS MCP Bridge <span class="ver">v4.2.1</span></h3>
         <button class="cls">&times;</button>
       </div>
       <div id="mcp-tabs">
@@ -913,7 +941,7 @@
     async function refreshStatus() {
       const mcpUrl = GM_getValue('mcp_url', DEFAULT_MCP_URL);
       secStatus.innerHTML = '<div class="mcp-status">连接中...</div>';
-      const client = new MCPClient(mcpUrl);
+      const client = getMCPClient();
       const healthy = await client.checkHealth();
 
       if (!healthy) {
@@ -1106,8 +1134,7 @@
         });
 
         resultDiv.innerHTML = '<div class="mcp-result">执行中...</div>';
-        const mcpUrl = GM_getValue('mcp_url', DEFAULT_MCP_URL);
-        const client = new MCPClient(mcpUrl);
+        const client = getMCPClient();
         try {
           const result = await client.callTool(toolName, args);
           const text = result?.content?.[0]?.text || '(no result)';
@@ -1595,6 +1622,8 @@
       const modelInput = secSettings.querySelector('#mcp-tts-model');
       if (modelInput) GM_setValue('tts_model', modelInput.value.trim());
       toast('已保存', 'success');
+      // 地址变更后重建共享 client
+      _sharedClient = null;
       refreshStatus();
     };
 
@@ -1689,11 +1718,12 @@
     // ═══════════════════════════════════════════════════════════════
     //  MCP Code Block Actions + System Instruction Folding
     // ═══════════════════════════════════════════════════════════════
+    // ── FIX 6: 解析失败返回 null，不再 fallback 成 {input} ──
     function parseToolArgs(rawArgs) {
       const text = (rawArgs || '').trim();
       if (!text) return {};
       try { return JSON.parse(text); }
-      catch { return { input: text }; }
+      catch { return null; }
     }
 
     function getMCPCodeInfo(block) {
@@ -1763,11 +1793,17 @@
         resendBtn.className = 'mcp-code-action resend';
         resendBtn.textContent = '重发';
         resendBtn.title = `重新执行 ${info.toolName}`;
+        // ── FIX 6: 参数解析失败友好提示 ──
         resendBtn.onclick = (e) => {
           e.preventDefault();
           e.stopPropagation();
           const latest = getMCPCodeInfo(block) || info;
-          executeToolCall(latest.toolName, parseToolArgs(latest.rawArgs));
+          const args = parseToolArgs(latest.rawArgs);
+          if (args === null) {
+            toast(`无法解析 ${latest.toolName} 的参数`, 'error');
+            return;
+          }
+          executeToolCall(latest.toolName, args);
           toast(`已重发: ${latest.toolName}`, 'info');
         };
 
