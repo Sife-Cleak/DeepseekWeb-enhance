@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DS MCP Bridge
 // @namespace    https://github.com/calendar0917/ds-enhance
-// @version      4.2.1
+// @version      4.2.2
 // @description  AI Chat 增强 — MCP 工具调用 + TTS 朗读 + 多站点适配
 // @author       ds-enhance
 // @match        https://chat.deepseek.com/*
@@ -365,16 +365,18 @@
   }
 
   // ── FIX 2 & 3: 只保留 ```mcp:name 协议；解析失败不 fallback；支持 final 标记 ──
+  // ── FIX 8: 一条回复里的多个工具调用 → 收集后一次性批量执行，不再逐个触发发送 ──
   function checkForToolCalls(content, { final = false } = {}) {
     if (!content || !toolRegistry.length) return;
 
     const re = new RegExp(TOOL_CALL_RE.source, 'g');
+    const calls = [];          // ← 收集本次所有合法调用
     let match;
+
     while ((match = re.exec(content)) !== null) {
       const toolName = match[1];
       const rawArgs = match[2].trim();
 
-      // 未知工具直接跳过（防止 AI 幻觉/复述导致误调用）
       if (!toolRegistry.some(t => t.name === toolName)) {
         console.warn(`${SCRIPT_PREFIX} 忽略未知工具: ${toolName}`);
         continue;
@@ -384,7 +386,6 @@
       try {
         args = rawArgs ? JSON.parse(rawArgs) : {};
       } catch (e) {
-        // 流式未结束 → 参数可能还没写完，等下一轮或 final；不再 fallback 成 {input}
         if (!final) continue;
         console.warn(`${SCRIPT_PREFIX} 参数 JSON 解析失败，跳过: ${toolName}`, e.message);
         toast(`${toolName} 参数解析失败，已跳过`, 'error');
@@ -399,14 +400,16 @@
         continue;
       }
 
-      // 去重：同一完整代码块只执行一次（progress / load / fetch 三处 hook 安全）
       const key = toolName + '::' + match[0];
       if (executedCalls.has(key)) continue;
       executedCalls.add(key);
 
-      console.log(`${SCRIPT_PREFIX} Tool call: ${toolName}`, args);
-      executeToolCall(toolName, args);
+      console.log(`${SCRIPT_PREFIX} Tool call queued: ${toolName}`, args);
+      calls.push({ toolName, args });
     }
+
+    // ← 一次性批量执行（并行），不再逐个触发
+    if (calls.length > 0) executeToolCallsBatch(calls);
   }
 
   function parseSSEChunk(rawText) {
@@ -540,60 +543,96 @@
   // ═══════════════════════════════════════════════════════════════
   //  Tool Execution & Result Injection
   // ═══════════════════════════════════════════════════════════════
-  async function executeToolCall(toolName, args) {
-    // ── FIX 7: 复用共享 client ──
+  // ── FIX 7: 复用共享 client ──
+  // ── FIX 8: 一条消息里多个工具并行执行，结果合并后只发一次 ──
+  async function executeToolCallsBatch(calls) {
     const client = getMCPClient();
 
-    try {
-      toast(`调用工具: ${toolName}...`, 'info');
-      const result = await client.callTool(toolName, args);
-      const resultText = result?.content?.[0]?.text || '(no result)';
-      const isError = result?.isError;
-
-      toast(isError ? `${toolName} 失败` : `${toolName} 完成`, isError ? 'error' : 'success');
-
-      if (!isError && (toolName === 'read_file' || toolName === 'list_directory')) {
-        const filename = (args.path || args.filename || 'tool_result.txt').split('/').pop().split('\\').pop();
-        addToolFileResult(filename, resultText, 'text/plain');
-        toast(`📁 ${filename} 已添加到文件列表`, 'success');
-        injectResultToChat(`[工具 ${toolName} 的结果已作为文件添加，共 ${resultText.length} 字符。发送下条消息时会自动附带文件内容。]`);
-      } else {
-        injectResultToChat(isError ? `Error: ${resultText}` : resultText);
+    const results = await Promise.all(calls.map(async ({ toolName, args }) => {
+      try {
+        toast(`调用工具: ${toolName}...`, 'info');
+        const result = await client.callTool(toolName, args);
+        const resultText = result?.content?.[0]?.text || '(no result)';
+        const isError = !!result?.isError;
+        toast(isError ? `${toolName} 失败` : `${toolName} 完成`, isError ? 'error' : 'success');
+        return { toolName, args, resultText, isError };
+      } catch (e) {
+        toast(`工具调用失败: ${e.message}`, 'error');
+        console.error(`${SCRIPT_PREFIX} Tool error:`, e);
+        return { toolName, args, resultText: e.message, isError: true };
       }
-    } catch (e) {
-      toast(`工具调用失败: ${e.message}`, 'error');
-      console.error(`${SCRIPT_PREFIX} Tool error:`, e);
-      injectResultToChat(`Error: ${e.message}`);
+    }));
+
+    const parts = [];
+    for (const r of results) {
+      if (!r.isError && (r.toolName === 'read_file' || r.toolName === 'list_directory')) {
+        const filename = (r.args.path || r.args.filename || 'tool_result.txt').split('/').pop().split('\\').pop();
+        addToolFileResult(filename, r.resultText, 'text/plain');
+        toast(`📁 ${filename} 已添加到文件列表`, 'success');
+        parts.push(`[工具 ${r.toolName} 的结果已作为文件添加，共 ${r.resultText.length} 字符。发送下条消息时会自动附带文件内容。]`);
+      } else {
+        parts.push(r.isError ? `Error: ${r.resultText}` : r.resultText);
+      }
     }
+
+    // 只注入一次（合并后的结果）
+    if (parts.length) injectResultToChat(parts.join('\n\n'));
   }
 
+  // 单工具执行入口 —— 供「重发」按钮使用
+  async function executeToolCall(toolName, args) {
+    return executeToolCallsBatch([{ toolName, args }]);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  Result Injection Queue — 合并多次结果，等待间隔后一次性发送
+  // ═══════════════════════════════════════════════════════════════
+  // 工具结果返回 → 点击发送之间的等待时长（ms）
+  // 避免 AI 刚结束流式就立刻发送，被站点判定为「发送频繁」而拦截
+  const AUTO_SEND_DELAY_MS = 4000;
+  let _resultQueue = [];
+  let _flushTimer = null;
+
   function injectResultToChat(resultText) {
-    setTimeout(async () => {
-      const wrappedText = `<tool_result>\n${resultText}\n</tool_result>`;
+    _resultQueue.push(resultText);
+    if (_flushTimer) clearTimeout(_flushTimer);
+    _flushTimer = setTimeout(_flushResults, AUTO_SEND_DELAY_MS);
+  }
 
-      const input = findInputElement();
-      if (!input) {
-        toast('找不到聊天输入框', 'error');
-        return;
-      }
+  async function _flushResults() {
+    const texts = _resultQueue.splice(0);
+    _flushTimer = null;
+    if (!texts.length) return;
 
-      input.focus();
-      await sleep(200);
-      setInputValue(input, wrappedText);
-      await sleep(500);
+    const combined = texts.join('\n\n');
+    const wrappedText = `<tool_result>\n${combined}\n</tool_result>`;
 
-      if (!getAutoSendEnabled()) {
-        toast('工具结果已填入输入框', 'info');
-        return;
-      }
+    const input = findInputElement();
+    if (!input) {
+      toast('找不到聊天输入框', 'error');
+      return;
+    }
 
-      simulateEnter(input);
-      await sleep(300);
+    input.focus();
+    await sleep(200);
+    setInputValue(input, wrappedText);
+    await sleep(500);
+
+    if (!getAutoSendEnabled()) {
+      toast('工具结果已填入输入框', 'info');
+      return;
+    }
+
+    // 先 Enter；若未清空（Enter 未生效）才点按钮，避免双重发送
+    simulateEnter(input);
+    await sleep(500);
+    const remaining = (input.value !== undefined ? input.value : input.textContent) || '';
+    if (remaining.trim().length > 0) {
       const sendBtn = findSendButton();
       if (sendBtn) sendBtn.click();
+    }
 
-      toast('工具结果已发送', 'success');
-    }, 1500);
+    toast('工具结果已发送', 'success');
   }
 
   function findInputElement() {
@@ -834,7 +873,7 @@
     panel.id = 'mcp-panel';
     panel.innerHTML = `
       <div class="hd">
-        <h3>DS MCP Bridge <span class="ver">v4.2.1</span></h3>
+        <h3>DS MCP Bridge <span class="ver">v4.2.2</span></h3>
         <button class="cls">&times;</button>
       </div>
       <div id="mcp-tabs">
@@ -1492,44 +1531,6 @@
 
       // Refresh
       secExt.querySelector('#ext-refresh')?.addEventListener('click', renderExtTab);
-
-      // Start/Stop/Remove
-      secExt.querySelectorAll('.ext-start').forEach(btn => {
-        btn.onclick = async () => {
-          const name = btn.dataset.name;
-          try {
-            const result = await extApiCall(`/api/external-servers/${name}/start`, 'POST');
-            toast(result.ok ? `${name} 已启动` : result.error, result.ok ? 'success' : 'error');
-            renderExtTab(); refreshStatus();
-          } catch (e) { toast(e.message, 'error'); }
-        };
-      });
-
-      secExt.querySelectorAll('.ext-stop').forEach(btn => {
-        btn.onclick = async () => {
-          const name = btn.dataset.name;
-          try {
-            const result = await extApiCall(`/api/external-servers/${name}/stop`, 'POST');
-            toast(result.ok ? `${name} 已停止` : result.error, result.ok ? 'success' : 'error');
-            renderExtTab(); refreshStatus();
-          } catch (e) { toast(e.message, 'error'); }
-        };
-      });
-
-      secExt.querySelectorAll('.ext-remove').forEach(btn => {
-        btn.onclick = async () => {
-          const name = btn.dataset.name;
-          if (!confirm(`确定删除 ${name}？`)) return;
-          try {
-            const result = await extApiCall(`/api/external-servers/${name}`, 'DELETE');
-            toast(result.ok ? `${name} 已删除` : result.error, result.ok ? 'success' : 'error');
-            renderExtTab(); refreshStatus();
-          } catch (e) { toast(e.message, 'error'); }
-        };
-      });
-
-      // Refresh
-      secExt.querySelector('#ext-refresh').onclick = renderExtTab;
     }
 
     // ═══════════════════════════════════════════════════════════════
