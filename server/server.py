@@ -17,6 +17,7 @@ import copy
 import json
 import uuid
 import argparse
+import inspect
 import logging
 import sys
 from pathlib import Path
@@ -36,7 +37,7 @@ from tools.mcp_external import ExternalMCPProxy
 from tools.tts import TOOL_DEFINITIONS as TTS_TOOLS, tts_synthesize, list_edge_voices
 from tools.file_processor import process_file
 
-__version__ = "4.0.0"
+__version__ = "4.0.1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,6 +134,64 @@ def cleanup_expired_sessions() -> None:
         for sid, _ in oldest:
             del sessions[sid]
             logger.info(f"Session evicted (max count): {sid}")
+
+# ─── Argument Sanitizing (fix for {"input": "<json>"} wrapper) ─
+def _unwrap_arguments(arguments: Any) -> dict[str, Any]:
+    """把 {"input": "<json字符串>"} 这类错误包装逐层解开，返回干净的 dict。
+
+    调用端（userscript / bridge）有时会把整个参数对象 json.dumps 后再塞进
+    一个 {"input": ...} 字典，甚至多层嵌套。这里做兼容，避免 handler 收到
+    非法关键字参数（例如 bing_search(input=...)）。
+    """
+    for _ in range(4):
+        if isinstance(arguments, dict) and set(arguments.keys()) == {"input"}:
+            inner = arguments["input"]
+            if isinstance(inner, str):
+                try:
+                    inner = json.loads(inner)
+                except json.JSONDecodeError:
+                    break
+            arguments = inner
+            continue
+        break
+    return arguments if isinstance(arguments, dict) else {}
+
+
+def _filter_kwargs(handler: Any, kwargs: dict[str, Any], tool_name: str) -> tuple[dict[str, Any], str | None]:
+    """按 handler 签名过滤 kwargs，返回 (可调用参数, 错误信息)。
+
+    - handler 接受 **kwargs 时原样放行
+    - 否则丢弃未知参数并给出明确提示，避免裸 TypeError
+    - 检查必填参数是否缺失
+    """
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return dict(kwargs), None
+
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs), None
+
+    accepted = {k: v for k, v in kwargs.items() if k in params}
+    dropped = sorted(set(kwargs) - set(accepted))
+    if dropped:
+        return accepted, (
+            f"工具 '{tool_name}' 参数不匹配，已忽略未知参数: {dropped}；"
+            f"该工具期望参数: {[p for p in params if p != 'api_key']}"
+        )
+
+    missing = [
+        n for n, p in params.items()
+        if p.default is inspect.Parameter.empty
+        and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        and n not in accepted
+    ]
+    if missing:
+        return accepted, f"工具 '{tool_name}' 缺少必填参数: {missing}"
+
+    return accepted, None
+
 
 # ─── App ───────────────────────────────────────────────────────
 @asynccontextmanager
@@ -360,7 +419,7 @@ async def handle_jsonrpc(msg: dict):
     """Process a single JSON-RPC 2.0 message."""
     method = msg.get("method", "")
     msg_id = msg.get("id")
-    params = msg.get("params", {})
+    params = msg.get("params", {}) or {}
 
     # Notifications have no id — acknowledge with 202
     if msg_id is None and method:
@@ -396,8 +455,14 @@ async def handle_jsonrpc(msg: dict):
         }
 
     if method == "tools/call":
-        tool_name = params.get("name", "")
-        arguments = params.get("arguments", {})
+        tool_name = params.get("name", "") or ""
+        raw_arguments = params.get("arguments", {})
+        arguments = _unwrap_arguments(raw_arguments)
+        if raw_arguments != arguments:
+            logger.warning(
+                f"已解包异常参数包装: {json.dumps(raw_arguments, ensure_ascii=False)[:200]} "
+                f"-> {json.dumps(arguments, ensure_ascii=False)[:200]}"
+            )
 
         # Check external tools first
         if tool_name in external_proxy.get_all_tool_names():
@@ -441,22 +506,34 @@ async def handle_jsonrpc(msg: dict):
 
         try:
             if tool_name in ASYNC_HANDLERS_MAP:
-                # Async handler
+                # Async handler: 展开成关键字参数
                 handler = ASYNC_HANDLERS_MAP[tool_name]
+                call_kwargs = dict(arguments)
                 # Pass api_key from config if the tool needs it
                 if tool_name == "bing_search":
                     svc_cfg = config.get("services", {}).get("web_search", {}).get("config", {})
-                    arguments.setdefault("api_key", svc_cfg.get("bing_api_key", ""))
-                result_text = await handler(**arguments)
+                    call_kwargs.setdefault("api_key", svc_cfg.get("bing_api_key", ""))
+
+                checked_kwargs, arg_error = _filter_kwargs(handler, call_kwargs, tool_name)
+                if arg_error:
+                    logger.error(f"参数校验失败: {arg_error}")
+                    result_text = arg_error
+                    is_error = True
+                else:
+                    result_text = await handler(**checked_kwargs)
+                    is_error = False
             elif tool_name in SYNC_HANDLERS:
+                # Sync handler: 传入整个参数 dict
                 result_text = SYNC_HANDLERS[tool_name](arguments)
+                is_error = False
             else:
                 result_text = f"工具 '{tool_name}' 没有对应的处理器，可能是配置错误"
+                is_error = True
 
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {"content": [{"type": "text", "text": str(result_text)}], "isError": False},
+                "result": {"content": [{"type": "text", "text": str(result_text)}], "isError": is_error},
             }
         except Exception as e:
             logger.error(f"工具执行失败: {e}")
